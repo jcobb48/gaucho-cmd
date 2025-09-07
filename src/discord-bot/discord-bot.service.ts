@@ -1,20 +1,15 @@
-
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  ChatInputCommandInteraction,
   Client as DiscordClient,
   GatewayIntentBits,
+  PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
-  PermissionFlagsBits,
-  ChatInputCommandInteraction,
 } from 'discord.js';
-import { execFile } from 'node:child_process';
 import { Client as SSHClient } from 'ssh2';
-import fs from 'node:fs';
-
-
 
 @Injectable()
 export class DiscordBotService implements OnModuleInit {
@@ -23,49 +18,41 @@ export class DiscordBotService implements OnModuleInit {
   private rest: REST;
   private allowedRole?: string;
   private allowedUser?: string;
-  private serviceName: string;
+
+  private req(name: string): string {
+    const v = this.cfg.get<string>(name);
+    if (!v || !String(v).trim()) throw new Error(`${name} not set`);
+    return v;
+  }
 
   constructor(private cfg: ConfigService) {
     this.client = new DiscordClient({ intents: [GatewayIntentBits.Guilds] });
-    this.rest = new REST({ version: '10' }).setToken(
-      this.cfg.get<string>('DISCORD_TOKEN')!,
-    );
+    this.rest = new REST({ version: '10' }).setToken(this.req('DISCORD_TOKEN'));
     this.allowedRole = this.cfg.get<string>('ALLOWED_ROLE_ID') || undefined;
     this.allowedUser = this.cfg.get<string>('ALLOWED_USER_ID') || undefined;
-    this.serviceName = this.cfg.get<string>('RESET_SERVICE', '').trim();
-    if (!this.serviceName) {
-      throw new Error('RESET_SERVICE not set');
-    }
   }
 
   async onModuleInit() {
     await this.registerSlash();
     this.wireEvents();
-    await this.client.login(this.cfg.get<string>('DISCORD_TOKEN'));
+    await this.client.login(this.req('DISCORD_TOKEN'));
   }
 
   private async registerSlash() {
     const cmd = new SlashCommandBuilder()
-      .setName('reset')
-      .setDescription('Restart the target systemd service locally');
+      .setName('restart')
+      .setDescription('Reinicia PZ Gaucho Server');
 
     await this.rest.put(
-      Routes.applicationGuildCommands(
-        this.cfg.get<string>('DISCORD_APP_ID')!,
-        this.cfg.get<string>('DISCORD_GUILD_ID')!,
-      ),
+      Routes.applicationGuildCommands(this.req('DISCORD_APP_ID'), this.req('DISCORD_GUILD_ID')),
       { body: [cmd.toJSON()] },
     );
     this.log.log('Slash command upserted');
   }
 
   private wireEvents() {
-    this.client.once('ready', () =>
-      this.log.log(`Logged in as ${this.client.user?.tag}`),
-    );
-
+    this.client.once('ready', () => this.log.log(`Logged in as ${this.client.user?.tag}`));
     this.client.on('interactionCreate', async (i) => {
-      this.log.debug(`Cmd received: ${i.isCommand}`)
       if (!i.isChatInputCommand()) return;
       if (i.commandName === 'reset') await this.handleReset(i);
     });
@@ -76,81 +63,81 @@ export class DiscordBotService implements OnModuleInit {
       await i.reply({ content: 'Not authorized.', ephemeral: true });
       return;
     }
-
     await i.deferReply({ ephemeral: true });
+
     try {
-      const { code, stdout, stderr } = await this.runRemote(this.cfg.get<string>('RESET_CMD')!);
+      const cmd = this.req('RESET_CMD'); // e.g. "sudo /bin/systemctl restart psrv.service"
+      const { code, stdout, stderr } = await this.runRemote(cmd);
       if (code === 0) {
-        await i.editReply('Restart requested. Exit code 0.');
+        await i.editReply('Reinicio exitoso, ahora a esperar que se haga el backup...');
       } else {
         const out = (stderr || stdout || 'no output').slice(0, 1900);
         await i.editReply(`Restart failed. code=${code}\n${out}`);
       }
     } catch (e: any) {
-      await i.editReply(`Exec error: ${e.message}`.slice(0, 1900));
+      await i.editReply(`Error: ${e.message}`.slice(0, 1900));
     }
   }
 
   private isAllowed(i: ChatInputCommandInteraction): boolean {
     if (this.allowedUser && i.user.id === this.allowedUser) return true;
     if (this.allowedRole && i.member && 'roles' in i.member) {
-      // @ts-ignore discord.js member typing
+      // @ts-ignore discord.js typing guard for GuildMember
       if (i.member.roles?.cache?.has?.(this.allowedRole)) return true;
     }
     return i.memberPermissions?.has(PermissionFlagsBits.Administrator) || false;
   }
 
-  
-private runRemote(cmd: string): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const conn = new SSHClient();
-    let stdout = '', stderr = '';
-    const host = this.cfg.get<string>('SSH_HOST')!;
+  private runRemote(cmd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+    const host = this.req('SSH_HOST');
     const port = Number(this.cfg.get<string>('SSH_PORT') || 22);
-    const username = this.cfg.get<string>('SSH_USER')!;
+    const username = this.req('SSH_USER');
+
+    // Key from env: prefer base64, else literal with \n escapes, else password
+    const keyB64 = this.cfg.get<string>('SSH_PRIVATE_KEY_B64');
+    const keyRaw = this.cfg.get<string>('SSH_PRIVATE_KEY');
+    const passphrase = this.cfg.get<string>('SSH_KEY_PASSPHRASE') || undefined;
     const password = this.cfg.get<string>('SSH_PASSWORD') || undefined;
-    const keyPath = this.cfg.get<string>('SSH_PRIVATE_KEY_PATH') || undefined;
 
-    const auth: any = { host, port, username };
-    if (keyPath) auth.privateKey = fs.readFileSync(keyPath);
-    else if (password) auth.password = password;
+    let privateKey: string | undefined;
+    if (keyB64) privateKey = Buffer.from(keyB64, 'base64').toString('utf8');
+    else if (keyRaw) privateKey = keyRaw.includes('\\n') ? keyRaw.replace(/\\n/g, '\n') : keyRaw;
 
-    conn.on('ready', () => {
-      // Assumes sudoers NOPASSWD for this exact command.
-      conn.exec(cmd, (err, stream) => {
-        if (err) { conn.end(); return reject(err); }
-        stream.on('close', (code: number) => { conn.end(); resolve({ code: code ?? 0, stdout, stderr }); })
-              .on('data', d => { stdout += d.toString(); })
-              .stderr.on('data', d => { stderr += d.toString(); });
-      });
-    })
-    .on('error', reject)
-    .connect(auth);
-    });
-  }
+    // Optional host key pinning
+    const pinned = this.cfg.get<string>('SSH_HOST_FINGERPRINT') || ''; // e.g. "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+    const hostVerifier = pinned
+      ? (hash: string) => hash === pinned
+      : undefined;
 
-  private restartService(): Promise<{ code: number; stdout: string; stderr: string }> {
-    return new Promise((resolve) => {
-      const child = execFile(
-        'sudo',
-        ['systemctl', 'restart', this.serviceName],
-        { timeout: 30_000 },
-        (err, stdout, stderr) => {
-          if (err) {
-            const anyErr = err as any;
-            resolve({
-              code: Number.isInteger(anyErr.code) ? anyErr.code : 1,
-              stdout: stdout?.toString() || '',
-              stderr: stderr?.toString() || String(err),
-            });
-          } else {
-            resolve({ code: 0, stdout: stdout?.toString() || '', stderr: '' });
-          }
-        },
-      );
-      child.on('error', (e) =>
-        resolve({ code: 1, stdout: '', stderr: String(e) }),
-      );
+    const auth: any = { host, port, username, hostVerifier };
+    if (privateKey) {
+      auth.privateKey = privateKey;
+      if (passphrase) auth.passphrase = passphrase;
+    } else if (password) {
+      auth.password = password;
+    } else {
+      throw new Error('No SSH credentials: set SSH_PRIVATE_KEY_B64 or SSH_PRIVATE_KEY or SSH_PASSWORD');
+    }
+
+    return new Promise((resolve, reject) => {
+      const conn = new SSHClient();
+      let stdout = '', stderr = '';
+      conn
+        .on('ready', () => {
+          // Requires NOPASSWD for this exact command on the host.
+          conn.exec(cmd, (err, stream) => {
+            if (err) { conn.end(); return reject(err); }
+            stream
+              .on('close', (code: number | null) => {
+                conn.end();
+                resolve({ code: code ?? 0, stdout, stderr });
+              })
+              .on('data', (d: Buffer) => { stdout += d.toString(); })
+              .stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+          });
+        })
+        .on('error', reject)
+        .connect(auth);
     });
   }
 }
