@@ -11,6 +11,9 @@ import {
   ChatInputCommandInteraction,
 } from 'discord.js';
 import { execFile } from 'node:child_process';
+import { Client as SSHClient } from 'ssh2';
+import fs from 'node:fs';
+
 
 
 @Injectable()
@@ -76,7 +79,7 @@ export class DiscordBotService implements OnModuleInit {
 
     await i.deferReply({ ephemeral: true });
     try {
-      const { code, stdout, stderr } = await this.restartService();
+      const { code, stdout, stderr } = await this.runRemote(this.cfg.get<string>('RESET_CMD')!);
       if (code === 0) {
         await i.editReply('Restart requested. Exit code 0.');
       } else {
@@ -95,6 +98,35 @@ export class DiscordBotService implements OnModuleInit {
       if (i.member.roles?.cache?.has?.(this.allowedRole)) return true;
     }
     return i.memberPermissions?.has(PermissionFlagsBits.Administrator) || false;
+  }
+
+  
+private runRemote(cmd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const conn = new SSHClient();
+    let stdout = '', stderr = '';
+    const host = this.cfg.get<string>('SSH_HOST')!;
+    const port = Number(this.cfg.get<string>('SSH_PORT') || 22);
+    const username = this.cfg.get<string>('SSH_USER')!;
+    const password = this.cfg.get<string>('SSH_PASSWORD') || undefined;
+    const keyPath = this.cfg.get<string>('SSH_PRIVATE_KEY_PATH') || undefined;
+
+    const auth: any = { host, port, username };
+    if (keyPath) auth.privateKey = fs.readFileSync(keyPath);
+    else if (password) auth.password = password;
+
+    conn.on('ready', () => {
+      // Assumes sudoers NOPASSWD for this exact command.
+      conn.exec(cmd, (err, stream) => {
+        if (err) { conn.end(); return reject(err); }
+        stream.on('close', (code: number) => { conn.end(); resolve({ code: code ?? 0, stdout, stderr }); })
+              .on('data', d => { stdout += d.toString(); })
+              .stderr.on('data', d => { stderr += d.toString(); });
+      });
+    })
+    .on('error', reject)
+    .connect(auth);
+    });
   }
 
   private restartService(): Promise<{ code: number; stdout: string; stderr: string }> {
