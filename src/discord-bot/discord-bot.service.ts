@@ -33,32 +33,39 @@ export class DiscordBotService implements OnModuleInit {
   }
 
   async onModuleInit() {
-    await this.registerSlash();
+    await this.registerSlashCommands();
     this.wireEvents();
     await this.client.login(this.req('DISCORD_TOKEN'));
   }
 
-  private async registerSlash() {
-    const cmd = new SlashCommandBuilder()
+  private async registerSlashCommands() {
+    const restartCmd = new SlashCommandBuilder()
       .setName('restart')
       .setDescription('Reinicia PZ Gaucho Server');
-
-    await this.rest.put(
+    const statusCmd = new SlashCommandBuilder()
+      .setName('status')
+      .setDescription('Devuelve el estado del server');
+    const t = await this.rest.put(
       Routes.applicationGuildCommands(this.req('DISCORD_APP_ID'), this.req('DISCORD_GUILD_ID')),
-      { body: [cmd.toJSON()] },
+      { body: [
+          restartCmd.toJSON(),
+          statusCmd.toJSON()
+        ],
+      },
     );
-    this.log.log('Slash command upserted');
+    this.log.log('SlashCommandsRegistered');
   }
 
   private wireEvents() {
     this.client.once('ready', () => this.log.log(`Logged in as ${this.client.user?.tag}`));
     this.client.on('interactionCreate', async (i) => {
       if (!i.isChatInputCommand()) return;
-      if (i.commandName === 'reset') await this.handleReset(i);
+      if (i.commandName === 'restart') await this.handleRestart(i);
+      if (i.commandName === 'status') await this.handleStatus(i);
     });
   }
 
-  private async handleReset(i: ChatInputCommandInteraction) {
+  private async handleRestart(i: ChatInputCommandInteraction) {
     if (!this.isAllowed(i)) {
       await i.reply({ content: 'Not authorized.', ephemeral: true });
       return;
@@ -66,18 +73,40 @@ export class DiscordBotService implements OnModuleInit {
     await i.deferReply({ ephemeral: true });
 
     try {
-      const cmd = this.req('RESET_CMD'); // e.g. "sudo /bin/systemctl restart psrv.service"
+      const cmd = this.req('RESTART_CMD');
       const { code, stdout, stderr } = await this.runRemote(cmd);
       if (code === 0) {
         await i.editReply('Reinicio exitoso, ahora a esperar que se haga el backup...');
       } else {
         const out = (stderr || stdout || 'no output').slice(0, 1900);
-        await i.editReply(`Restart failed. code=${code}\n${out}`);
+        await i.editReply(`Restart command failed. code=${code}\n${out}`);
       }
     } catch (e: any) {
       await i.editReply(`Error: ${e.message}`.slice(0, 1900));
     }
   }
+
+    private async handleStatus(i: ChatInputCommandInteraction) {
+    if (!this.isAllowed(i)) {
+      await i.reply({ content: 'Not authorized.', ephemeral: true });
+      return;
+    }
+    await i.deferReply({ ephemeral: true });
+
+    try {
+      const cmd = this.req('STATUS_CMD');
+      const { code, stdout, stderr } = await this.runRemote(cmd);
+      if (code === 0) {
+        await i.editReply(`Estado del server: ${stdout}`);
+      } else {
+        const out = (stderr || stdout || 'no output').slice(0, 1900);
+        await i.editReply(`Status command failed. code=${code}\n${out}`);
+      }
+    } catch (e: any) {
+      await i.editReply(`Error: ${e.message}`.slice(0, 1900));
+    }
+  }
+
 
   private isAllowed(i: ChatInputCommandInteraction): boolean {
     if (this.allowedUser && i.user.id === this.allowedUser) return true;
