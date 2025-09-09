@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   ChatInputCommandInteraction,
@@ -41,7 +41,10 @@ export class DiscordBotService implements OnModuleInit {
   private async registerSlashCommands() {
     const restartCmd = new SlashCommandBuilder()
       .setName('restart')
-      .setDescription('Reinicia PZ Gaucho Server');
+      .setDescription('Reinicia PZ Gaucho Server, envia varios msgs a los players, 2 min de demora.');
+    const restartForceCmd = new SlashCommandBuilder()
+      .setName('restart-force')
+      .setDescription('Reinicia PZ Gaucho Server de inmediato, sin avisar a los players.');
     const statusCmd = new SlashCommandBuilder()
       .setName('status')
       .setDescription('Devuelve el estado del server');
@@ -49,7 +52,8 @@ export class DiscordBotService implements OnModuleInit {
       Routes.applicationGuildCommands(this.req('DISCORD_APP_ID'), this.req('DISCORD_GUILD_ID')),
       { body: [
           restartCmd.toJSON(),
-          statusCmd.toJSON()
+          statusCmd.toJSON(),
+          restartForceCmd.toJSON(),
         ],
       },
     );
@@ -60,33 +64,65 @@ export class DiscordBotService implements OnModuleInit {
     this.client.once('ready', () => this.log.log(`Logged in as ${this.client.user?.tag}`));
     this.client.on('interactionCreate', async (i) => {
       if (!i.isChatInputCommand()) return;
+      this.log.log(`Command received: ${i.commandName}`)
       if (i.commandName === 'restart') await this.handleRestart(i);
+      if (i.commandName === 'restart-force') await this.handleRestart(i, true);
       if (i.commandName === 'status') await this.handleStatus(i);
     });
   }
 
-  private async handleRestart(i: ChatInputCommandInteraction) {
+  private async runPZCmd(cmd: string): Promise<void> {
+    var pzCmdString = this.req("PZ_ADMIN_CMD").replace("$1", `"${cmd}"`);
+    this.log.log(`Running PZ command: ${pzCmdString}`)
+    const { code, stdout, stderr } = await this.runRemote(pzCmdString);
+    if (code !== 0) {
+      throw new InternalServerErrorException(`${stdout} - ${stderr}`)
+    }
+  }
+
+  private async sendPZAdminMessage(cmd: string): Promise<void> {
+    return this.runPZCmd(`servermsg ${cmd}`)
+  }
+
+  private async handleRestart(i: ChatInputCommandInteraction, force: boolean = false) {
     if (!this.isAllowed(i)) {
       await i.reply({ content: 'Not authorized.', ephemeral: true });
       return;
     }
     await i.deferReply({ ephemeral: true });
+    await i.editReply('Comenzando reinicio...');
+
 
     try {
+      if (!force) {
+        await this.sendPZAdminMessage('ADVERTENCIA: El server se reiniciará en 2 minutos')
+        await i.followUp('ADVERTENCIA: El server se reiniciará en 2 minutos');
+        await new Promise<void>(r => setTimeout(r, 90 * 1000));
+
+        
+        await this.sendPZAdminMessage("ADVERTENCIA: El server se reiniciará en 30 segundos")
+        await i.followUp('ADVERTENCIA: El server se reiniciará en 30 segundos');
+        await new Promise<void>(r => setTimeout(r, 20 * 1000));
+
+        await this.sendPZAdminMessage("ADVERTENCIA: El server se reiniciará en 10 segundos")
+        await i.followUp('ADVERTENCIA: El server se reiniciará en 10 segundos');
+        await new Promise<void>(r => setTimeout(r, 10 * 1000));
+      }
+
       const cmd = this.req('RESTART_CMD');
       const { code, stdout, stderr } = await this.runRemote(cmd);
       if (code === 0) {
-        await i.editReply('Reinicio exitoso, ahora a esperar que se haga el backup...');
+        await i.followUp('Reinicio exitoso, esperar a que inicie...');
       } else {
         const out = (stderr || stdout || 'no output').slice(0, 1900);
-        await i.editReply(`Restart command failed. code=${code}\n${out}`);
+        await i.followUp(`Restart command failed. code=${code}\n${out}`);
       }
     } catch (e: any) {
-      await i.editReply(`Error: ${e.message}`.slice(0, 1900));
+      await i.followUp(`Command Failed: ${e.message}`.slice(0, 1900));
     }
   }
 
-    private async handleStatus(i: ChatInputCommandInteraction) {
+  private async handleStatus(i: ChatInputCommandInteraction) {
     if (!this.isAllowed(i)) {
       await i.reply({ content: 'Not authorized.', ephemeral: true });
       return;
@@ -117,7 +153,7 @@ export class DiscordBotService implements OnModuleInit {
     return i.memberPermissions?.has(PermissionFlagsBits.Administrator) || false;
   }
 
-  private runRemote(cmd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  private async runRemote(cmd: string): Promise<{ code: number; stdout: string; stderr: string }> {
     const host = this.req('SSH_HOST');
     const port = Number(this.cfg.get<string>('SSH_PORT') || 22);
     const username = this.req('SSH_USER');
@@ -133,7 +169,7 @@ export class DiscordBotService implements OnModuleInit {
     else if (keyRaw) privateKey = keyRaw.includes('\\n') ? keyRaw.replace(/\\n/g, '\n') : keyRaw;
 
     // Optional host key pinning
-    const pinned = this.cfg.get<string>('SSH_HOST_FINGERPRINT') || ''; // e.g. "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+    const pinned = this.cfg.get<string>('SSH_HOST_FINGERPRINT') || '';
     const hostVerifier = pinned
       ? (hash: string) => hash === pinned
       : undefined;
