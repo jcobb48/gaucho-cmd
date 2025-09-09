@@ -48,12 +48,22 @@ export class DiscordBotService implements OnModuleInit {
     const statusCmd = new SlashCommandBuilder()
       .setName('status')
       .setDescription('Devuelve el estado del server');
+    const adminMsgCmd = new SlashCommandBuilder()
+      .setName('admin-msg')
+      .setDescription('Envia un mensaje de admin al server')
+      .addStringOption(o =>
+          o.setName('msg')
+          .setDescription('Message to send')
+          .setRequired(true)
+          .setMaxLength(1800) // safe size
+        );
     const t = await this.rest.put(
       Routes.applicationGuildCommands(this.req('DISCORD_APP_ID'), this.req('DISCORD_GUILD_ID')),
       { body: [
           restartCmd.toJSON(),
           statusCmd.toJSON(),
           restartForceCmd.toJSON(),
+          adminMsgCmd.toJSON(),
         ],
       },
     );
@@ -68,6 +78,7 @@ export class DiscordBotService implements OnModuleInit {
       if (i.commandName === 'restart') await this.handleRestart(i);
       if (i.commandName === 'restart-force') await this.handleRestart(i, true);
       if (i.commandName === 'status') await this.handleStatus(i);
+      if (i.commandName === 'admin-msg') return this.handleAdminMsg(i);
     });
   }
 
@@ -80,8 +91,25 @@ export class DiscordBotService implements OnModuleInit {
     }
   }
 
-  private async sendPZAdminMessage(cmd: string): Promise<void> {
-    return this.runPZCmd(`servermsg ${cmd}`)
+  private async sendAdminMessage(msg: string){
+    const sendMsgCMD = this.req("PZ_SEND_MSG_CMD").replace("$1", msg)
+    const { code, stdout, stderr } = await this.runRemote(sendMsgCMD);
+    if (code !== 0) {
+      const out = (stderr || stdout || 'no output').slice(0, 1900);
+      throw new InternalServerErrorException(`Send Msg Failed. code=${code}\n${out}`);
+    }
+  }
+
+
+  private async handleAdminMsg(i: ChatInputCommandInteraction) {
+    const msg = i.options.getString('msg', true);
+    await i.deferReply({ ephemeral: true });
+    try {
+      this.sendAdminMessage(msg);
+      await i.followUp(`Mensaje enviado: ${msg}`);
+    } catch (e: any) {
+      await i.followUp(`Command Failed: ${e.message}`.slice(0, 1900));
+    }
   }
 
   private async handleRestart(i: ChatInputCommandInteraction, force: boolean = false) {
@@ -95,16 +123,16 @@ export class DiscordBotService implements OnModuleInit {
 
     try {
       if (!force) {
-        await this.sendPZAdminMessage('ADVERTENCIA: El server se reiniciará en 2 minutos')
+        await this.sendAdminMessage('ADVERTENCIA: El server se reiniciará en 2 minutos')
         await i.followUp('ADVERTENCIA: El server se reiniciará en 2 minutos');
         await new Promise<void>(r => setTimeout(r, 90 * 1000));
 
         
-        await this.sendPZAdminMessage("ADVERTENCIA: El server se reiniciará en 30 segundos")
+        await this.sendAdminMessage("ADVERTENCIA: El server se reiniciará en 30 segundos")
         await i.followUp('ADVERTENCIA: El server se reiniciará en 30 segundos');
         await new Promise<void>(r => setTimeout(r, 20 * 1000));
 
-        await this.sendPZAdminMessage("ADVERTENCIA: El server se reiniciará en 10 segundos")
+        await this.sendAdminMessage("ADVERTENCIA: El server se reiniciará en 10 segundos")
         await i.followUp('ADVERTENCIA: El server se reiniciará en 10 segundos');
         await new Promise<void>(r => setTimeout(r, 10 * 1000));
       }
@@ -148,7 +176,7 @@ export class DiscordBotService implements OnModuleInit {
     if (this.allowedUser && i.user.id === this.allowedUser) return true;
     if (this.allowedRole && i.member && 'roles' in i.member) {
       // @ts-ignore discord.js typing guard for GuildMember
-      if (i.member.roles?.cache?.has?.(this.allowedRole)) return true;
+      if (i.member.roles.includes(this.allowedRole)) return true;
     }
     return i.memberPermissions?.has(PermissionFlagsBits.Administrator) || false;
   }
